@@ -19,6 +19,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 
 #include "time_functions_shared.h"
 #include "../aesd-char-driver/aesd_ioctl.h"
@@ -26,7 +27,7 @@
 #define USE_AESD_CHAR_DEVICE
 
 #ifdef USE_AESD_CHAR_DEVICE
-#define OUTPUT_FILE "/dev/aesdchar"
+#define OUTPUT_FILE "/dev/ttyS1"
 #else
 #define OUTPUT_FILE "/var/tmp/aesdsocketdata"
 #endif
@@ -277,12 +278,17 @@ static void _aesdsocket_update_timestamp_thread(union sigval sig_val)
 
 static void * _aesdsocket_thread_fn(void* thread_param)
 {
+    fd_set read_fds;
+    struct timeval timeout_val = {
+        .tv_sec = 1,
+        .tv_usec = 0
+    };
+    int sel_result;
     size_t rd_len = 0;
     char rd_buff[1024];
     char *wr_buff = NULL;
     char *new_wr_buff = NULL;
-    char *cmd_str = NULL;
-    struct aesd_seekto seekto;
+    char *wr_str = NULL;
     ssize_t sent_bytes = 0, written, total_read = 0;
     aesdsocket_list_data_t * thread_data = (aesdsocket_list_data_t *)thread_param;
     void *addr;
@@ -375,92 +381,62 @@ static void * _aesdsocket_thread_fn(void* thread_param)
 					strcat(wr_buff, rd_buff);
 					if(wr_buff[strlen(wr_buff) - 1u] == '\n')
 					{
-						if((cmd_str = strstr(wr_buff, "AESDCHAR_IOCSEEKTO:")) != NULL)
+						if((wr_str = strstr(wr_buff, "TIMEOUT:")) != NULL)
 						{
-							cmd_str += 19;
-							if((cmd_str = strtok((char *) cmd_str, ",")) != NULL)
-							{
-								seekto.write_cmd = (uint32_t)atoi(cmd_str);
-								if((cmd_str = strtok(NULL, ",")) != NULL)
-								{
-									seekto.write_cmd_offset = (uint32_t)atoi(cmd_str);									
-								}
-								else
-								{
-									pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
-									free(wr_buff);
-									shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
-									close(thread_data->aesd_data.recv_s_fd);
-									close(thread_data->aesd_data.fd);
-#ifndef USE_AESD_CHAR_DEVICE    
-									unlink(OUTPUT_FILE);
-#endif
-									thread_data->thread_complete = true;
-									return thread_data;
-								}
-								
-								if(ioctl(thread_data->aesd_data.fd, AESDCHAR_IOCSEEKTO , &seekto) < 0)
-								{
-									pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
-									free(wr_buff);
-									syslog(LOG_ERR, "ioctl() error: %d", errno);
-									shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
-									close(thread_data->aesd_data.recv_s_fd);
-									close(thread_data->aesd_data.fd);
-#ifndef USE_AESD_CHAR_DEVICE    
-									unlink(OUTPUT_FILE);
-#endif
-									thread_data->thread_complete = true;
-									return thread_data;
-								}
-								else
-								{
-									syslog(LOG_INFO, "ioctl() completed successfully, cmd: %u, cmd_offset: %u", seekto.write_cmd, seekto.write_cmd_offset);
-									free(wr_buff);
-									wr_buff = NULL;
-								}
-							}
-							else
-							{
-								pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
-								free(wr_buff);
-								shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
-								close(thread_data->aesd_data.recv_s_fd);
-								close(thread_data->aesd_data.fd);
-#ifndef USE_AESD_CHAR_DEVICE    
-								unlink(OUTPUT_FILE);
-#endif
-								thread_data->thread_complete = true;
-								return thread_data;
-							}
-						}
-						else if((written = write(thread_data->aesd_data.fd, wr_buff, strlen(wr_buff))) != strlen(wr_buff))
+							wr_str += 8;
+                            timeout_val.tv_sec = (uint32_t)atoi(wr_str);
+                        }
+                        else
+                        {
+                            /* Use Default timeout of 1sec */
+                        }
+
+                        if((wr_str = strstr(wr_buff, "MESSAGE:")) != NULL)
 						{
-							if (written == -1) {
-								pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
-								free(wr_buff);
-								syslog(LOG_ERR, "write() error: %d", errno);
-								shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
-								close(thread_data->aesd_data.recv_s_fd);
-								close(thread_data->aesd_data.fd);
+							wr_str += 8;
+                            if((written = write(thread_data->aesd_data.fd, wr_str, strlen(wr_str))) != strlen(wr_str))
+                            {
+                                if (written == -1) {
+                                    pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
+                                    free(wr_buff);
+                                    syslog(LOG_ERR, "write() error: %d", errno);
+                                    shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
+                                    close(thread_data->aesd_data.recv_s_fd);
+                                    close(thread_data->aesd_data.fd);
+    #ifndef USE_AESD_CHAR_DEVICE    
+                                    unlink(OUTPUT_FILE);
+    #endif
+                                    thread_data->thread_complete = true;
+                                    return thread_data;
+                                }
+                            }
+                            else
+                            {
+                                /* Continue */
+                                syslog(LOG_INFO, "From: %d, wrote: %s to fd: %d", thread_data->aesd_data.recv_s_fd, wr_buff, thread_data->aesd_data.fd);
+                                free(wr_buff);
+                                wr_buff = NULL;
+    #ifndef USE_AESD_CHAR_DEVICE
+                                fsync(thread_data->aesd_data.fd);  // Ensure data is written to disk
+    #endif
+                                lseek(thread_data->aesd_data.fd, 0, SEEK_SET); // Go to the start of the file
+                            }
+                        }
+                        else
+                        {
+                            pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
+                            free(wr_buff);
+                            shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
+                            close(thread_data->aesd_data.recv_s_fd);
+                            close(thread_data->aesd_data.fd);
 #ifndef USE_AESD_CHAR_DEVICE    
-								unlink(OUTPUT_FILE);
+                            unlink(OUTPUT_FILE);
 #endif
-								thread_data->thread_complete = true;
-								return thread_data;
-							}
-						}
-						else
-						{
-							/* Continue */
-							syslog(LOG_INFO, "From: %d, wrote: %s to fd: %d", thread_data->aesd_data.recv_s_fd, wr_buff, thread_data->aesd_data.fd);
-							free(wr_buff);
-							wr_buff = NULL;
-#ifndef USE_AESD_CHAR_DEVICE
-							fsync(thread_data->aesd_data.fd);  // Ensure data is written to disk
-#endif
-							lseek(thread_data->aesd_data.fd, 0, SEEK_SET); // Go to the start of the file
-						}
+                            thread_data->thread_complete = true;
+                            return thread_data;
+                        }
+						
+                            
 					}
 					else
 					{
@@ -485,43 +461,78 @@ static void * _aesdsocket_thread_fn(void* thread_param)
 				
 				syslog(LOG_INFO, "Output Stream attempting on fd: %d", thread_data->aesd_data.fd);
 
-				while ((total_read = read(thread_data->aesd_data.fd, rd_buff, sizeof(rd_buff))) > 0) 
-				{
-					sent_bytes = 0;
-					while (sent_bytes < total_read) 
-					{
-						syslog(LOG_INFO, "%s", &rd_buff[sent_bytes]);
-						written = send(thread_data->aesd_data.recv_s_fd, rd_buff + sent_bytes, total_read - sent_bytes, 0);
-						if (written == -1) 
-						{
-							syslog(LOG_ERR, "send() error: %d", errno);
-							pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
-							free(wr_buff);
-							shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
-							close(thread_data->aesd_data.recv_s_fd);
-							close(thread_data->aesd_data.fd);
+                FD_ZERO(&read_fds);
+                FD_SET(thread_data->aesd_data.fd, &read_fds);
+
+                if(sel_result = select(uart_fd + 1, &read_fds, NULL, NULL, &timeout) == -1)
+                {
+                    syslog(LOG_ERR, "send() error: %d", errno);
+                    pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
+                    free(wr_buff);
+                    shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
+                    close(thread_data->aesd_data.recv_s_fd);
+                    close(thread_data->aesd_data.fd);
 #ifndef USE_AESD_CHAR_DEVICE    
 					unlink(OUTPUT_FILE);
 #endif
-							thread_data->thread_complete = true;
-							return thread_data;
-						}
-						sent_bytes += written;
-					}
-				}
-				if (total_read == -1) {
-					syslog(LOG_ERR, "read() error: %d", errno);
-					pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
-					free(wr_buff);
-					shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
-					close(thread_data->aesd_data.recv_s_fd);
-					close(thread_data->aesd_data.fd);
+                    thread_data->thread_complete = true;
+                    return thread_data;
+                }
+                else if(sel_result == 0)
+                {
+                    syslog(LOG_ERR, "send() timeout");
+                    pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
+                    free(wr_buff);
+                    shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
+                    close(thread_data->aesd_data.recv_s_fd);
+                    close(thread_data->aesd_data.fd);
 #ifndef USE_AESD_CHAR_DEVICE    
 					unlink(OUTPUT_FILE);
 #endif
-					thread_data->thread_complete = true;
-					return thread_data;
-				}
+                    thread_data->thread_complete = true;
+                    return thread_data;
+                }
+                else
+                {
+                    while ((total_read = read(thread_data->aesd_data.fd, rd_buff, sizeof(rd_buff))) > 0) 
+                    {
+                        sent_bytes = 0;
+                        while (sent_bytes < total_read) 
+                        {
+                            syslog(LOG_INFO, "%s", &rd_buff[sent_bytes]);
+                            written = send(thread_data->aesd_data.recv_s_fd, rd_buff + sent_bytes, total_read - sent_bytes, 0);
+                            if (written == -1) 
+                            {
+                                syslog(LOG_ERR, "send() error: %d", errno);
+                                pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
+                                free(wr_buff);
+                                shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
+                                close(thread_data->aesd_data.recv_s_fd);
+                                close(thread_data->aesd_data.fd);
+    #ifndef USE_AESD_CHAR_DEVICE    
+                        unlink(OUTPUT_FILE);
+    #endif
+                                thread_data->thread_complete = true;
+                                return thread_data;
+                            }
+                            sent_bytes += written;
+                        }
+                    }
+                    if (total_read == -1) {
+                        syslog(LOG_ERR, "read() error: %d", errno);
+                        pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
+                        free(wr_buff);
+                        shutdown(thread_data->aesd_data.recv_s_fd, SHUT_RD);
+                        close(thread_data->aesd_data.recv_s_fd);
+                        close(thread_data->aesd_data.fd);
+    #ifndef USE_AESD_CHAR_DEVICE    
+                        unlink(OUTPUT_FILE);
+    #endif
+                        thread_data->thread_complete = true;
+                        return thread_data;
+                    }
+                }
+				
 				
 				
 				memset(rd_buff, 0, sizeof(rd_buff));
