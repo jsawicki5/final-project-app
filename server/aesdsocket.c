@@ -22,7 +22,6 @@
 #include <sys/select.h>
 
 #include "time_functions_shared.h"
-#include "../aesd-char-driver/aesd_ioctl.h"
 
 #define USE_AESD_CHAR_DEVICE
 
@@ -385,6 +384,7 @@ static void * _aesdsocket_thread_fn(void* thread_param)
 						{
 							wr_str += 8;
                             timeout_val.tv_sec = (uint32_t)atoi(wr_str);
+                            syslog(LOG_INFO, "timeout set to: %ld", timeout_val.tv_sec);
                         }
                         else
                         {
@@ -413,7 +413,7 @@ static void * _aesdsocket_thread_fn(void* thread_param)
                             else
                             {
                                 /* Continue */
-                                syslog(LOG_INFO, "From: %d, wrote: %s to fd: %d", thread_data->aesd_data.recv_s_fd, wr_buff, thread_data->aesd_data.fd);
+                                syslog(LOG_INFO, "From: %d, wrote: %s to fd: %d", thread_data->aesd_data.recv_s_fd, wr_str, thread_data->aesd_data.fd);
                                 free(wr_buff);
                                 wr_buff = NULL;
     #ifndef USE_AESD_CHAR_DEVICE
@@ -464,7 +464,7 @@ static void * _aesdsocket_thread_fn(void* thread_param)
                 FD_ZERO(&read_fds);
                 FD_SET(thread_data->aesd_data.fd, &read_fds);
 
-                if(sel_result = select(uart_fd + 1, &read_fds, NULL, NULL, &timeout) == -1)
+                if((sel_result = select(thread_data->aesd_data.fd + 1, &read_fds, NULL, NULL, &timeout_val)) == -1)
                 {
                     syslog(LOG_ERR, "send() error: %d", errno);
                     pthread_mutex_unlock(thread_data->aesd_data.t_mutex);
@@ -532,10 +532,10 @@ static void * _aesdsocket_thread_fn(void* thread_param)
                         return thread_data;
                     }
                 }
+			
+		(void)read_fds;	
 				
-				
-				
-				memset(rd_buff, 0, sizeof(rd_buff));
+		memset(rd_buff, 0, sizeof(rd_buff));
 
                 close(thread_data->aesd_data.fd);
 #ifndef USE_AESD_CHAR_DEVICE    
